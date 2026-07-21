@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capsule-telegram-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in step with rust-toolchain.toml.
+  RUST_TOOLCHAIN: "1.95.0"
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  wasm:
+    name: WASM build and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The target and the custom getrandom backend come from
+      # .cargo/config.toml; passing --target explicitly keeps the job honest if
+      # that file is ever changed by accident.
+      - run: cargo build --release --target wasm32-unknown-unknown
+      - run: cargo clippy --release --target wasm32-unknown-unknown -- -D warnings
+
+  tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # The default target is WASM, which cannot execute test binaries, so the
+      # host target has to be named explicitly.
+      - run: cargo test --target x86_64-unknown-linux-gnu
+
+  package:
+    name: Capsule package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: astrid-runtime/setup-astrid@f6502094923659cf85d24c1816ac547789cf0638 # v2
+        with:
+          version: latest
+          verify: sigstore
+      # `cargo build` succeeding is not sufficient: the packager rejects targets
+      # it cannot load, and manifest problems (bad capability tables, unwired
+      # tool handlers) only surface here. Both are how this capsule silently
+      # broke before — it compiled and installed while its IPC ACLs were denied.
+      - run: astrid capsule check .
+      - run: astrid capsule build . --output ./dist
+      - name: Verify the artifact was produced
+        run: test -f ./dist/astrid-capsule-telegram.capsule
+
+  compat:
+    name: Runtime compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astrid-runtime/setup-astrid@f6502094923659cf85d24c1816ac547789cf0638 # v2
+        with:
+          version: latest
+          verify: sigstore
+      # Capsule.toml declares the runtime range it supports. If the latest
+      # released runtime falls outside it, the capsule is either stale or the
+      # bound is wrong — both are worth failing on rather than discovering at
+      # install time.
+      - name: Check astrid-version against the latest runtime
+        run: |
+          set -euo pipefail
+          require=$(grep -m1 '^astrid-version' Capsule.toml | cut -d'"' -f2)
+          runtime=$(astrid --version | awk '{print $2}')
+          echo "Capsule.toml requires '$require'; latest runtime is $runtime"
+          python3 - "$require" "$runtime" <<'PY'
+          import re, sys
+          req, have = sys.argv[1], sys.argv[2]
+          m = re.match(r'^\s*(>=|<=|=|\^|~)?\s*(\d+)\.(\d+)\.(\d+)\s*$', req)
+          if not m:
+              print(f"::warning::cannot parse astrid-version '{req}'; skipping")
+              sys.exit(0)
+          op = m.group(1) or "="
+          want = tuple(int(x) for x in m.group(2, 3, 4))
+          got = tuple(int(x) for x in have.split("."))
+          ok = {">=": got >= want, "<=": got <= want, "=": got == want,
+                "^": got >= want and got[0] == want[0],
+                "~": got >= want and got[:2] == want[:2]}[op]
+          if not ok:
+              print(f"::error::runtime {have} does not satisfy astrid-version '{req}'")
+              sys.exit(1)
+          print(f"runtime {have} satisfies '{req}'")
+          PY

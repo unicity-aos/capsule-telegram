@@ -4,69 +4,60 @@
 //! synchronous (WASM single-threaded).
 
 use astrid_sdk::prelude::*;
-use serde::Deserialize;
 use serde_json::json;
 
 use crate::types::{InlineKeyboardMarkup, TgMessage, TgResponse, Update};
 
 const BASE_URL: &str = "https://api.telegram.org";
 
-/// The SDK's `http::send()` returns a JSON envelope wrapping the actual
-/// HTTP response.
-#[derive(Deserialize)]
-struct HttpEnvelope {
-    status: u16,
-    body: String,
-}
-
-/// Unwrap the SDK HTTP envelope from the response and check HTTP status.
+/// Check the HTTP status and return the response body.
+///
+/// Pre-0.7 SDKs returned a JSON envelope (`{status, body}`) that had to be
+/// unwrapped before the Telegram payload was reachable. `http::Response` is now
+/// the response itself, with typed `status()` / `text()` accessors.
 ///
 /// Returns the response body string on success, or an appropriate `SysError`
 /// for rate-limiting, server errors, and client errors.
-fn unwrap_envelope(resp: http::Response, method: &str) -> Result<String, SysError> {
-    let envelope: HttpEnvelope = resp
-        .json()
-        .map_err(|e| SysError::ApiError(format!("{method}: failed to parse HTTP envelope: {e}")))?;
+fn read_body(resp: http::Response, method: &str) -> Result<String, SysError> {
+    let status = resp.status();
+    let body = resp
+        .text()
+        .map_err(|e| SysError::ApiError(format!("{method}: response body is not UTF-8: {e}")))?
+        .to_owned();
 
     // Check HTTP status before attempting to parse the Telegram response.
-    if envelope.status == 429 {
+    if status == 429 {
         return Err(SysError::ApiError(format!(
             "{method}: Rate limited by Telegram API"
         )));
     }
-    if envelope.status >= 500 {
-        let truncated: String = envelope.body.chars().take(200).collect();
-        let suffix = if envelope.body.chars().count() > 200 {
+    if status >= 500 {
+        let truncated: String = body.chars().take(200).collect();
+        let suffix = if body.chars().count() > 200 {
             "..."
         } else {
             ""
         };
         return Err(SysError::ApiError(format!(
-            "{method}: server error {}: {truncated}{suffix}",
-            envelope.status
+            "{method}: server error {status}: {truncated}{suffix}"
         )));
     }
-    if envelope.status >= 400 {
+    if status >= 400 {
         // Try to extract the Telegram error description from the response body.
-        if let Ok(err_resp) =
-            serde_json::from_str::<TgResponse<serde_json::Value>>(&envelope.body)
+        if let Ok(err_resp) = serde_json::from_str::<TgResponse<serde_json::Value>>(&body)
+            && !err_resp.ok
         {
-            if !err_resp.ok {
-                return Err(SysError::ApiError(format!(
-                    "{method}: {}",
-                    err_resp
-                        .description
-                        .unwrap_or_else(|| format!("HTTP {}", envelope.status)),
-                )));
-            }
+            return Err(SysError::ApiError(format!(
+                "{method}: {}",
+                err_resp
+                    .description
+                    .unwrap_or_else(|| format!("HTTP {status}")),
+            )));
         }
-        return Err(SysError::ApiError(format!(
-            "{method}: HTTP {}",
-            envelope.status
-        )));
+        return Err(SysError::ApiError(format!("{method}: HTTP {status}")));
     }
 
-    Ok(envelope.body)
+    Ok(body)
 }
 
 /// Parse a Telegram API response from the SDK's HTTP envelope.
@@ -74,11 +65,12 @@ fn parse_response<T: serde::de::DeserializeOwned>(
     resp: http::Response,
     method: &str,
 ) -> Result<T, SysError> {
-    let body = unwrap_envelope(resp, method)?;
+    let body = read_body(resp, method)?;
 
     // Parse the Telegram JSON from the body string.
-    let parsed: TgResponse<T> = serde_json::from_str(&body)
-        .map_err(|e| SysError::ApiError(format!("{method}: failed to parse Telegram response: {e}")))?;
+    let parsed: TgResponse<T> = serde_json::from_str(&body).map_err(|e| {
+        SysError::ApiError(format!("{method}: failed to parse Telegram response: {e}"))
+    })?;
 
     if !parsed.ok {
         return Err(SysError::ApiError(format!(
@@ -159,8 +151,8 @@ pub fn edit_message_text(
 
     // Telegram returns "message is not modified" (HTTP 400) when text is
     // unchanged — not a real error for our throttled-edit pattern. Catch that
-    // specific error from `unwrap_envelope` and treat it as success.
-    let body_str = match unwrap_envelope(resp, "editMessageText") {
+    // specific error from `read_body` and treat it as success.
+    let body_str = match read_body(resp, "editMessageText") {
         Ok(b) => b,
         Err(e) => {
             let msg = e.to_string();

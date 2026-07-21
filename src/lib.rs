@@ -13,7 +13,7 @@ mod telegram;
 mod types;
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use astrid_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -34,12 +34,58 @@ const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 /// Maximum age before a pending approval or elicitation is considered stale.
 const PENDING_INTERACTION_TTL: Duration = Duration::from_secs(300);
 
+/// Wake-up interval while parked in the unconfigured idle state. The host caps
+/// a single sleep at 60s.
+const IDLE_PARK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Maximum accumulated text buffer size (bytes) during streaming. Prevents
 /// unbounded memory growth from very long agent responses in WASM.
 const MAX_TEXT_BUFFER: usize = 256 * 1024;
 
 /// KV key for the last processed Telegram update offset.
 const KV_OFFSET: &str = "tg.offset";
+
+/// Monotonic clock reading, standing in for [`std::time::Instant`].
+///
+/// `Instant::now()` panics on `wasm32-unknown-unknown` ("time not implemented
+/// on this platform") — the guest has no platform clock, so all time comes from
+/// the host via `astrid:sys`. The absolute value is meaningless across capsule
+/// reloads; only differences between readings are.
+fn monotonic_now() -> Duration {
+    time::monotonic()
+}
+
+/// Elapsed time since an earlier [`monotonic_now`] reading, saturating at zero.
+fn elapsed_since(earlier: Duration) -> Duration {
+    monotonic_now().saturating_sub(earlier)
+}
+
+/// Stay loaded but inert, for when the capsule is installed without a token.
+///
+/// The run loop cannot simply return: the kernel's `check_health` marks a
+/// capsule `Failed` whenever its run handle has finished, without inspecting
+/// *how* it finished, so even `Ok(())` is read as a crash and the capsule is
+/// restarted until its attempts are exhausted. Signalling ready and then
+/// sleeping keeps an unconfigured capsule quiet and harmless instead.
+fn park_idle() -> Result<(), SysError> {
+    let _ = runtime::signal_ready();
+    let mut sleep_failures: u32 = 0;
+    loop {
+        if time::sleep(IDLE_PARK_INTERVAL).is_err() {
+            sleep_failures = sleep_failures.saturating_add(1);
+            // A host clock that refuses to sleep would turn this into a hot
+            // spin, burning the CPU epoch budget until the kernel traps the
+            // instance. Exiting is the milder failure.
+            if sleep_failures >= 10 {
+                return Err(SysError::ApiError(
+                    "host sleep repeatedly failed while idle".into(),
+                ));
+            }
+        } else {
+            sleep_failures = 0;
+        }
+    }
+}
 
 /// Persisted session mapping entry.
 #[derive(Serialize, Deserialize)]
@@ -54,16 +100,16 @@ struct TurnState {
     /// Accumulated response text (markdown).
     text_buffer: String,
     /// Last time we edited the Telegram message.
-    last_edit: Instant,
+    last_edit: Duration,
     /// Whether the current message has been finalized (e.g. before a tool).
     finalized: bool,
     /// When this turn was created (kept for diagnostics).
     #[allow(dead_code)]
-    created_at: Instant,
+    created_at: Duration,
     /// Last time activity was observed (stream delta or approval received).
     /// Used for timeout so that long-running turns with ongoing activity are
     /// not prematurely reaped.
-    last_activity: Instant,
+    last_activity: Duration,
 }
 
 /// Pending approval waiting for a callback button press.
@@ -72,14 +118,14 @@ struct PendingApproval {
     /// Full request_id (the callback_data may use a truncated token).
     full_request_id: String,
     /// When this approval was created (for TTL-based cleanup).
-    created_at: Instant,
+    created_at: Duration,
 }
 
 /// Pending text-based elicitation waiting for the user to reply.
 struct PendingElicitation {
     request_id: String,
     /// When this elicitation was created (for TTL-based cleanup).
-    created_at: Instant,
+    created_at: Duration,
 }
 
 /// Telegram Bot uplink capsule.
@@ -92,12 +138,21 @@ impl TelegramBot {
     #[astrid::run]
     fn run(&self) -> Result<(), SysError> {
         // ── Config ──────────────────────────────────────────────────────
-        let bot_token = env::var("bot_token")
-            .map_err(|_| SysError::ApiError("bot_token not configured".into()))?;
+        // `env::var` resolves a missing key to `Ok("")`, so it cannot report an
+        // unconfigured token; `var_opt` is the disambiguator. Without this the
+        // capsule would start with an empty token and fail every Telegram call.
+        let Some(bot_token) = env::var_opt("bot_token")?.filter(|t| !t.trim().is_empty()) else {
+            log::warn(
+                "No bot_token configured — the Telegram capsule is installed but \
+                 will stay idle. Set one with `capsule config` (or reinstall) and \
+                 restart the daemon to activate it.",
+            );
+            return park_idle();
+        };
         let allowed_users = parse_allowed_users(&env::var("allowed_user_ids").unwrap_or_default());
 
         if allowed_users.is_empty() {
-            let _ = log::warn(
+            log::warn(
                 "Telegram bot starting with NO user restrictions — \
                  any Telegram user can interact with the agent. \
                  Set allowed_user_ids to restrict access.",
@@ -105,12 +160,18 @@ impl TelegramBot {
         }
 
         // ── Register uplink ─────────────────────────────────────────────
-        uplink::register("telegram", "telegram", "interactive")?;
+        uplink::register("telegram", "telegram", "chat")?;
 
         // ── Subscribe to IPC topics ─────────────────────────────────────
         let topics = [
-            "agent.v1.response",
+            // ORDER MATTERS: the delta topic must precede the response topic.
+            // Subscriptions are polled in this order within a single pass, and
+            // `handle_final_response` REMOVES the turn. Polling the terminal
+            // response first would drop any same-pass deltas (they find no turn),
+            // truncating the accumulated buffer that a terminal event with empty
+            // `text` falls back to. The CLI uplink documents the same ordering.
             "agent.v1.stream.delta",
+            "agent.v1.response",
             "astrid.v1.approval",
             "astrid.v1.elicit.*",
             "astrid.v1.response.*",
@@ -134,19 +195,19 @@ impl TelegramBot {
         let mut pending_elicitations: HashMap<i64, PendingElicitation> = HashMap::new();
         let mut consecutive_ipc_errors: u32 = 0;
 
-        let _ = log::info("Telegram bot started");
+        log::info("Telegram bot started");
 
         // ── Main loop ───────────────────────────────────────────────────
         let mut consecutive_errors: u32 = 0;
-        let mut next_poll_at = Instant::now();
+        let mut next_poll_at = monotonic_now();
 
         loop {
             // Phase A: poll Telegram for new updates (skip if backing off).
-            if Instant::now() >= next_poll_at {
+            if monotonic_now() >= next_poll_at {
                 match telegram::get_updates(&bot_token, offset, POLL_TIMEOUT) {
                     Ok(updates) => {
                         consecutive_errors = 0;
-                        next_poll_at = Instant::now();
+                        next_poll_at = monotonic_now();
                         for update in updates {
                             offset = update.update_id + 1;
                             handle_telegram_update(
@@ -161,7 +222,7 @@ impl TelegramBot {
                             );
                         }
                         if let Err(e) = kv::set_json(KV_OFFSET, &offset) {
-                            let _ = log::warn(format!(
+                            log::warn(format!(
                                 "Failed to persist poll offset: {e:?} — \
                                  restart may reprocess recent updates"
                             ));
@@ -170,11 +231,11 @@ impl TelegramBot {
                     Err(e) => {
                         consecutive_errors = consecutive_errors.saturating_add(1);
                         let backoff_secs = 2u64.pow(consecutive_errors.min(6)).min(60);
-                        let _ = log::warn(format!(
+                        log::warn(format!(
                             "Telegram poll error: {e:?} — backing off {backoff_secs}s \
                              (consecutive errors: {consecutive_errors})"
                         ));
-                        next_poll_at = Instant::now() + Duration::from_secs(backoff_secs);
+                        next_poll_at = monotonic_now() + Duration::from_secs(backoff_secs);
                     }
                 }
             }
@@ -184,11 +245,11 @@ impl TelegramBot {
             // consecutive errors when an entire pass fails.
             let mut ipc_pass_ok = true;
             for handle in &sub_handles {
-                match ipc::poll_bytes(handle) {
-                    Ok(bytes) if !bytes.is_empty() => {
+                match handle.poll() {
+                    Ok(poll) => {
                         handle_ipc_poll(
                             &bot_token,
-                            &bytes,
+                            &poll,
                             &session_to_chat,
                             &sessions,
                             &mut turns,
@@ -196,10 +257,9 @@ impl TelegramBot {
                             &mut pending_elicitations,
                         );
                     }
-                    Ok(_) => {}
                     Err(e) => {
                         ipc_pass_ok = false;
-                        let _ = log::error(format!("IPC poll error: {e:?}"));
+                        log::error(format!("IPC poll error: {e:?}"));
                     }
                 }
             }
@@ -208,8 +268,7 @@ impl TelegramBot {
             } else {
                 consecutive_ipc_errors = consecutive_ipc_errors.saturating_add(1);
                 if consecutive_ipc_errors >= 50 {
-                    let _ =
-                        log::error("Too many consecutive IPC errors — shutting down");
+                    log::error("Too many consecutive IPC errors — shutting down");
                     return Err(SysError::ApiError(
                         "IPC subscription failed, capsule terminated".into(),
                     ));
@@ -222,13 +281,13 @@ impl TelegramBot {
             // TOCTOU races from double elapsed() checks.
             let expired_turn_ids: Vec<i64> = turns
                 .iter()
-                .filter(|(_, turn)| turn.last_activity.elapsed() > TURN_TIMEOUT)
+                .filter(|(_, turn)| elapsed_since(turn.last_activity) > TURN_TIMEOUT)
                 .map(|(&chat_id, _)| chat_id)
                 .collect();
 
             for chat_id in &expired_turn_ids {
                 if let Some(turn) = turns.remove(chat_id) {
-                    let _ = log::warn(format!(
+                    log::warn(format!(
                         "Turn for chat {chat_id} timed out after {}s — cleaning up",
                         TURN_TIMEOUT.as_secs()
                     ));
@@ -243,8 +302,8 @@ impl TelegramBot {
             }
 
             pending_approvals.retain(|_token, approval| {
-                if approval.created_at.elapsed() > PENDING_INTERACTION_TTL {
-                    let _ = log::warn(format!(
+                if elapsed_since(approval.created_at) > PENDING_INTERACTION_TTL {
+                    log::warn(format!(
                         "Approval {} for chat {} expired — cleaning up",
                         approval.full_request_id, approval.chat_id,
                     ));
@@ -255,8 +314,8 @@ impl TelegramBot {
             });
 
             pending_elicitations.retain(|chat_id, eli| {
-                if eli.created_at.elapsed() > PENDING_INTERACTION_TTL {
-                    let _ = log::warn(format!(
+                if elapsed_since(eli.created_at) > PENDING_INTERACTION_TTL {
+                    log::warn(format!(
                         "Elicitation {} for chat {chat_id} expired — cleaning up",
                         eli.request_id,
                     ));
@@ -268,8 +327,9 @@ impl TelegramBot {
 
             // Only sleep when we skipped the Telegram poll (during backoff).
             // During normal operation the 1s long-poll provides natural pacing.
-            if Instant::now() < next_poll_at {
-                std::thread::sleep(Duration::from_millis(50));
+            if monotonic_now() < next_poll_at {
+                // No threads on wasm32-unknown-unknown; yield through the host clock.
+                let _ = time::sleep(Duration::from_millis(50));
             }
         }
     }
@@ -277,6 +337,10 @@ impl TelegramBot {
 
 // ── Telegram Update Handling ────────────────────────────────────────────────
 
+// Threads the run loop's per-chat state maps through to the handler.
+// Collapsing these into a context struct is a worthwhile follow-up, but is
+// deliberately out of scope for the SDK migration.
+#[allow(clippy::too_many_arguments)]
 fn handle_telegram_update(
     token: &str,
     allowed_users: &[i64],
@@ -299,7 +363,14 @@ fn handle_telegram_update(
         );
     }
     if let Some(cb) = &update.callback_query {
-        handle_callback(token, allowed_users, cb, sessions, pending_approvals, pending_elicitations);
+        handle_callback(
+            token,
+            allowed_users,
+            cb,
+            sessions,
+            pending_approvals,
+            pending_elicitations,
+        );
     }
 }
 
@@ -333,7 +404,7 @@ fn handle_message(
         });
         let topic = format!("astrid.v1.elicit.response.{req_id}");
         if let Err(e) = ipc::publish_json(&topic, &payload) {
-            let _ = log::error(format!(
+            log::error(format!(
                 "Failed to publish elicitation response for {req_id}: {e:?}",
             ));
             // Re-insert so the user can retry.
@@ -371,7 +442,7 @@ fn handle_message(
     let session_id = sessions
         .entry(chat_id)
         .or_insert_with(|| {
-            let sid = new_session_id(chat_id);
+            let sid = new_session_id(chat_id, wall_clock_millis());
             session_to_chat.insert(sid.clone(), chat_id);
             save_session(chat_id, &sid);
             sid
@@ -382,7 +453,7 @@ fn handle_message(
     let placeholder = match telegram::send_message(token, chat_id, "Thinking...", None, None) {
         Ok(m) => m,
         Err(e) => {
-            let _ = log::warn(format!("Failed to send placeholder: {e:?}"));
+            log::warn(format!("Failed to send placeholder: {e:?}"));
             return;
         }
     };
@@ -390,15 +461,13 @@ fn handle_message(
     let _ = telegram::send_typing(token, chat_id);
 
     // Start turn tracking.
-    let now = Instant::now();
+    let now = monotonic_now();
     turns.insert(
         chat_id,
         TurnState {
             msg_id: placeholder.message_id,
             text_buffer: String::new(),
-            last_edit: now
-                .checked_sub(EDIT_THROTTLE)
-                .unwrap_or_else(Instant::now),
+            last_edit: now.checked_sub(EDIT_THROTTLE).unwrap_or(now),
             finalized: false,
             created_at: now,
             last_activity: now,
@@ -412,7 +481,7 @@ fn handle_message(
         "session_id": session_id,
     });
     if let Err(e) = ipc::publish_json("user.v1.prompt", &payload) {
-        let _ = log::error(format!("Failed to publish user input: {e:?}"));
+        log::error(format!("Failed to publish user input: {e:?}"));
         let _ = telegram::edit_message_text(
             token,
             chat_id,
@@ -508,7 +577,7 @@ fn handle_callback(
                 });
                 let topic = format!("astrid.v1.approval.response.{full_id}");
                 if let Err(e) = ipc::publish_json(&topic, &payload) {
-                    let _ = log::error(format!(
+                    log::error(format!(
                         "Failed to publish approval response for {full_id}: {e:?}"
                     ));
                     // Re-insert so user can retry.
@@ -570,7 +639,7 @@ fn handle_callback(
                 });
                 let topic = format!("astrid.v1.elicit.response.{full_id}");
                 if let Err(e) = ipc::publish_json(&topic, &payload) {
-                    let _ = log::error(format!(
+                    log::error(format!(
                         "Failed to publish elicitation response for {full_id}: {e:?}"
                     ));
                     // Re-insert so user can retry.
@@ -590,8 +659,7 @@ fn handle_callback(
                     Some(&format!("Selected: {value}")),
                 );
             } else {
-                let _ =
-                    telegram::answer_callback_query(token, &cb.id, Some("Elicitation expired"));
+                let _ = telegram::answer_callback_query(token, &cb.id, Some("Elicitation expired"));
             }
         }
         _ => {
@@ -604,40 +672,41 @@ fn handle_callback(
 
 fn handle_ipc_poll(
     token: &str,
-    poll_bytes: &[u8],
+    poll: &ipc::PollResult,
     session_to_chat: &HashMap<String, i64>,
     sessions: &HashMap<i64, String>,
     turns: &mut HashMap<i64, TurnState>,
     pending_approvals: &mut HashMap<String, PendingApproval>,
     pending_elicitations: &mut HashMap<i64, PendingElicitation>,
 ) {
-    let envelope: Value = match serde_json::from_slice(poll_bytes) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    if let Some(dropped) = envelope.get("dropped").and_then(|d| d.as_u64()) {
-        if dropped > 0 {
-            let _ = log::warn(format!(
-                "IPC bus dropped {dropped} messages — responses may be stale"
-            ));
-        }
+    if poll.dropped > 0 {
+        log::warn(format!(
+            "IPC bus dropped {} messages — responses may be stale",
+            poll.dropped
+        ));
+    }
+    if poll.lagged > 0 {
+        log::warn(format!(
+            "IPC subscription lagged {} messages — responses may be stale",
+            poll.lagged
+        ));
     }
 
-    let Some(messages) = envelope.get("messages").and_then(|m| m.as_array()) else {
-        return;
-    };
-
-    for msg in messages {
-        let topic = msg.get("topic").and_then(|t| t.as_str()).unwrap_or("");
-        let Some(payload) = msg.get("payload") else {
-            continue;
+    for msg in &poll.messages {
+        // The 0.7 bus carries the payload as a JSON string; the pre-0.7
+        // poll envelope nested it as a JSON value.
+        let payload: Value = match serde_json::from_str(&msg.payload) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn(format!("Skipping malformed payload on {}: {e}", msg.topic));
+                continue;
+            }
         };
 
         handle_ipc_event(
             token,
-            topic,
-            payload,
+            &msg.topic,
+            &payload,
             session_to_chat,
             sessions,
             turns,
@@ -647,6 +716,10 @@ fn handle_ipc_poll(
     }
 }
 
+// Threads the run loop's per-chat state maps through to the handler.
+// Collapsing these into a context struct is a worthwhile follow-up, but is
+// deliberately out of scope for the SDK migration.
+#[allow(clippy::too_many_arguments)]
 fn handle_ipc_event(
     token: &str,
     topic: &str,
@@ -726,15 +799,9 @@ fn handle_ipc_event(
 
             // Bump activity so the turn isn't reaped while waiting for user input.
             if let Some(turn) = turns.get_mut(&chat_id) {
-                turn.last_activity = Instant::now();
+                turn.last_activity = monotonic_now();
             }
-            handle_elicitation_request(
-                token,
-                chat_id,
-                request_id,
-                field,
-                pending_elicitations,
-            );
+            handle_elicitation_request(token, chat_id, request_id, field, pending_elicitations);
         }
 
         // Catch-all for stream deltas that use a different topic pattern.
@@ -774,9 +841,9 @@ fn handle_stream_delta(token: &str, chat_id: i64, text: &str, turns: &mut HashMa
             turn.text_buffer.push_str(&text[..boundary]);
         }
     }
-    turn.last_activity = Instant::now();
+    turn.last_activity = monotonic_now();
 
-    if turn.last_edit.elapsed() >= EDIT_THROTTLE && !turn.text_buffer.is_empty() {
+    if elapsed_since(turn.last_edit) >= EDIT_THROTTLE && !turn.text_buffer.is_empty() {
         let html = format::md_to_telegram_html(&turn.text_buffer);
         let display = format::truncate_for_edit(&html);
 
@@ -790,7 +857,7 @@ fn handle_stream_delta(token: &str, chat_id: i64, text: &str, turns: &mut HashMa
             let _ =
                 telegram::edit_message_text(token, chat_id, turn.msg_id, &display, Some("HTML"));
         }
-        turn.last_edit = Instant::now();
+        turn.last_edit = monotonic_now();
     }
 }
 
@@ -815,11 +882,9 @@ fn handle_final_response(
             if let Some((first, rest)) = chunks.split_first() {
                 if turn.finalized {
                     // Send as new message.
-                    let _ =
-                        telegram::send_message(token, chat_id, first, Some("HTML"), None);
+                    let _ = telegram::send_message(token, chat_id, first, Some("HTML"), None);
                     for chunk in rest {
-                        let _ =
-                            telegram::send_message(token, chat_id, chunk, Some("HTML"), None);
+                        let _ = telegram::send_message(token, chat_id, chunk, Some("HTML"), None);
                     }
                 } else {
                     // Edit the existing message with the final text.
@@ -839,6 +904,10 @@ fn handle_final_response(
     }
 }
 
+// Threads the run loop's per-chat state maps through to the handler.
+// Collapsing these into a context struct is a worthwhile follow-up, but is
+// deliberately out of scope for the SDK migration.
+#[allow(clippy::too_many_arguments)]
 fn handle_approval_request(
     token: &str,
     chat_id: i64,
@@ -851,7 +920,7 @@ fn handle_approval_request(
 ) {
     // Flush any in-progress text and bump activity timestamp.
     if let Some(turn) = turns.get_mut(&chat_id) {
-        turn.last_activity = Instant::now();
+        turn.last_activity = monotonic_now();
         if !turn.text_buffer.is_empty() && !turn.finalized {
             finalize_turn_text(token, chat_id, turn);
         }
@@ -878,13 +947,13 @@ fn handle_approval_request(
     // Detect (extremely unlikely) hash collision: if the token already maps
     // to a different request_id, log and evict the old entry rather than
     // silently overwriting it.
-    if let Some(existing) = pending_approvals.get(&cb_token) {
-        if existing.full_request_id != request_id {
-            let _ = log::warn(format!(
-                "Callback token collision: '{}' maps to both '{}' and '{}'",
-                cb_token, existing.full_request_id, request_id,
-            ));
-        }
+    if let Some(existing) = pending_approvals.get(&cb_token)
+        && existing.full_request_id != request_id
+    {
+        log::warn(format!(
+            "Callback token collision: '{}' maps to both '{}' and '{}'",
+            cb_token, existing.full_request_id, request_id,
+        ));
     }
 
     pending_approvals.insert(
@@ -892,7 +961,7 @@ fn handle_approval_request(
         PendingApproval {
             chat_id,
             full_request_id: request_id.to_string(),
-            created_at: Instant::now(),
+            created_at: monotonic_now(),
         },
     );
 
@@ -940,7 +1009,7 @@ fn handle_elicitation_request(
                 if data.len() <= 64 {
                     Some((o.to_string(), data))
                 } else {
-                    let _ = log::warn(format!(
+                    log::warn(format!(
                         "Elicitation option '{o}' exceeds 64-byte callback limit, skipping"
                     ));
                     None
@@ -954,7 +1023,7 @@ fn handle_elicitation_request(
                 chat_id,
                 PendingElicitation {
                     request_id: request_id.to_string(),
-                    created_at: Instant::now(),
+                    created_at: monotonic_now(),
                 },
             );
             let keyboard = telegram::inline_keyboard(buttons);
@@ -976,7 +1045,7 @@ fn handle_elicitation_request(
         chat_id,
         PendingElicitation {
             request_id: request_id.to_string(),
-            created_at: Instant::now(),
+            created_at: monotonic_now(),
         },
     );
     let _ = telegram::send_message(
@@ -1070,12 +1139,26 @@ fn parse_allowed_users(s: &str) -> Vec<i64> {
 }
 
 /// Generate a deterministic-ish session ID from chat_id + timestamp.
-fn new_session_id(chat_id: i64) -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+/// Wall-clock milliseconds since the Unix epoch, read from the host.
+///
+/// `SystemTime::now()` panics on `wasm32-unknown-unknown` exactly like
+/// `Instant::now()` does — the guest has no platform clock at all, so
+/// wall-clock time must come from the host through the SDK.
+fn wall_clock_millis() -> u128 {
+    time::now()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis())
-        .unwrap_or(0);
-    format!("tg-{chat_id}-{ts:x}")
+        .unwrap_or(0)
+}
+
+/// Build a session id for a chat from a wall-clock millisecond timestamp.
+///
+/// The timestamp is an explicit input rather than read here so this stays a
+/// pure function: the host clock call traps outside a running capsule, which
+/// would make this untestable on the native test target.
+fn new_session_id(chat_id: i64, ts_millis: u128) -> String {
+    format!("tg-{chat_id}-{ts_millis:x}")
 }
 
 fn session_kv_key(chat_id: i64) -> String {
@@ -1089,13 +1172,17 @@ fn save_session(chat_id: i64, session_id: &str) {
             session_id: session_id.to_string(),
         },
     ) {
-        let _ = log::warn(format!("Failed to persist session for chat {chat_id}: {e:?}"));
+        log::warn(format!(
+            "Failed to persist session for chat {chat_id}: {e:?}"
+        ));
     }
 }
 
 fn delete_session(chat_id: i64) {
     if let Err(e) = kv::delete(&session_kv_key(chat_id)) {
-        let _ = log::warn(format!("Failed to delete session for chat {chat_id}: {e:?}"));
+        log::warn(format!(
+            "Failed to delete session for chat {chat_id}: {e:?}"
+        ));
     }
 }
 
@@ -1103,12 +1190,11 @@ fn load_sessions() -> HashMap<i64, String> {
     let keys = kv::list_keys("tg.session.").unwrap_or_default();
     let mut map = HashMap::new();
     for key in keys {
-        if let Some(chat_id_str) = key.strip_prefix("tg.session.") {
-            if let Ok(chat_id) = chat_id_str.parse::<i64>() {
-                if let Ok(entry) = kv::get_json::<SessionEntry>(&key) {
-                    map.insert(chat_id, entry.session_id);
-                }
-            }
+        if let Some(chat_id_str) = key.strip_prefix("tg.session.")
+            && let Ok(chat_id) = chat_id_str.parse::<i64>()
+            && let Ok(entry) = kv::get_json::<SessionEntry>(&key)
+        {
+            map.insert(chat_id, entry.session_id);
         }
     }
     map
@@ -1125,7 +1211,10 @@ mod tests {
 
     #[test]
     fn parse_allowed_users_with_spaces() {
-        assert_eq!(parse_allowed_users(" 123 , 456 , 789 "), vec![123, 456, 789]);
+        assert_eq!(
+            parse_allowed_users(" 123 , 456 , 789 "),
+            vec![123, 456, 789]
+        );
     }
 
     #[test]
@@ -1166,7 +1255,8 @@ mod tests {
 
     #[test]
     fn new_session_id_format() {
-        let sid = new_session_id(12345);
+        let sid = new_session_id(12345, 0x1f2e3d);
+        assert_eq!(sid, "tg-12345-1f2e3d");
         assert!(sid.starts_with("tg-12345-"));
         // Should contain a hex timestamp after the second dash.
         let parts: Vec<&str> = sid.splitn(3, '-').collect();
@@ -1178,11 +1268,14 @@ mod tests {
 
     #[test]
     fn new_session_id_unique() {
-        let a = new_session_id(1);
-        let b = new_session_id(1);
-        // Verify both session IDs are correctly formatted without relying on timing.
+        // Distinct timestamps must yield distinct ids for the same chat. The
+        // timestamp is an explicit input now, so this asserts real uniqueness
+        // instead of depending on the clock advancing between two calls.
+        let a = new_session_id(1, 1);
+        let b = new_session_id(1, 2);
         assert!(a.starts_with("tg-1-"));
         assert!(b.starts_with("tg-1-"));
+        assert_ne!(a, b);
     }
 
     #[test]
