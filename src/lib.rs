@@ -34,6 +34,10 @@ const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 /// Maximum age before a pending approval or elicitation is considered stale.
 const PENDING_INTERACTION_TTL: Duration = Duration::from_secs(300);
 
+/// Wake-up interval while parked in the unconfigured idle state. The host caps
+/// a single sleep at 60s.
+const IDLE_PARK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Maximum accumulated text buffer size (bytes) during streaming. Prevents
 /// unbounded memory growth from very long agent responses in WASM.
 const MAX_TEXT_BUFFER: usize = 256 * 1024;
@@ -54,6 +58,33 @@ fn monotonic_now() -> Duration {
 /// Elapsed time since an earlier [`monotonic_now`] reading, saturating at zero.
 fn elapsed_since(earlier: Duration) -> Duration {
     monotonic_now().saturating_sub(earlier)
+}
+
+/// Stay loaded but inert, for when the capsule is installed without a token.
+///
+/// The run loop cannot simply return: the kernel's `check_health` marks a
+/// capsule `Failed` whenever its run handle has finished, without inspecting
+/// *how* it finished, so even `Ok(())` is read as a crash and the capsule is
+/// restarted until its attempts are exhausted. Signalling ready and then
+/// sleeping keeps an unconfigured capsule quiet and harmless instead.
+fn park_idle() -> Result<(), SysError> {
+    let _ = runtime::signal_ready();
+    let mut sleep_failures: u32 = 0;
+    loop {
+        if time::sleep(IDLE_PARK_INTERVAL).is_err() {
+            sleep_failures = sleep_failures.saturating_add(1);
+            // A host clock that refuses to sleep would turn this into a hot
+            // spin, burning the CPU epoch budget until the kernel traps the
+            // instance. Exiting is the milder failure.
+            if sleep_failures >= 10 {
+                return Err(SysError::ApiError(
+                    "host sleep repeatedly failed while idle".into(),
+                ));
+            }
+        } else {
+            sleep_failures = 0;
+        }
+    }
 }
 
 /// Persisted session mapping entry.
@@ -110,9 +141,14 @@ impl TelegramBot {
         // `env::var` resolves a missing key to `Ok("")`, so it cannot report an
         // unconfigured token; `var_opt` is the disambiguator. Without this the
         // capsule would start with an empty token and fail every Telegram call.
-        let bot_token = env::var_opt("bot_token")?
-            .filter(|t| !t.trim().is_empty())
-            .ok_or_else(|| SysError::ApiError("bot_token not configured".into()))?;
+        let Some(bot_token) = env::var_opt("bot_token")?.filter(|t| !t.trim().is_empty()) else {
+            log::warn(
+                "No bot_token configured — the Telegram capsule is installed but \
+                 will stay idle. Set one with `capsule config` (or reinstall) and \
+                 restart the daemon to activate it.",
+            );
+            return park_idle();
+        };
         let allowed_users = parse_allowed_users(&env::var("allowed_user_ids").unwrap_or_default());
 
         if allowed_users.is_empty() {
