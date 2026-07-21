@@ -1,6 +1,6 @@
 # capsule-telegram
 
-Telegram Bot uplink capsule for [Astrid OS](https://github.com/unicity-astrid/astrid) — bridges the Telegram Bot API to the kernel IPC bus, giving your Astrid agent a Telegram chat interface.
+Telegram Bot uplink capsule for [Unicity AOS](https://github.com/unicity-aos/aos-ce) — bridges the Telegram Bot API to the kernel IPC bus, giving your Unicity AOS agent a Telegram chat interface.
 
 ## Features
 
@@ -24,27 +24,27 @@ Telegram Bot uplink capsule for [Astrid OS](https://github.com/unicity-astrid/as
 ### 2. Install the Capsule
 
 ```bash
-astrid capsule install @unicity-astrid/capsule-telegram
+aos capsule install @unicity-aos/capsule-telegram
 ```
 
 Or from a local checkout:
 
 ```bash
-astrid capsule install ~/path/to/capsule-telegram
+aos capsule install ~/path/to/capsule-telegram
 ```
 
 During installation, you'll be prompted for:
 - **Bot Token** — the token from BotFather
 - **Allowed User IDs** — comma-separated Telegram user IDs (leave empty to allow all users)
 
-Configuration is preserved across reinstalls (use `astrid capsule remove --purge` to clear it).
+Configuration is preserved across reinstalls (use `aos capsule remove --purge` to clear it).
 
 > **Tip:** To find your Telegram user ID, message [@userinfobot](https://t.me/userinfobot).
 
 ### 3. Start the Daemon and Use It
 
 ```bash
-astrid start
+aos start
 ```
 
 Open your bot in Telegram and send a message. The agent will respond in the chat.
@@ -52,7 +52,7 @@ Open your bot in Telegram and send a message. The agent will respond in the chat
 ## Architecture
 
 ```
-Telegram Bot API                Astrid Kernel IPC Bus
+Telegram Bot API                Runtime Kernel IPC Bus
   │                                │
   │  getUpdates (HTTP long poll)   │
   │◄───────────────────────────────│
@@ -107,7 +107,7 @@ All state (sessions, update offset) is persisted in the kernel KV store.
 cargo build --release
 
 # Package an installable .capsule artifact
-astrid capsule build . --output ./dist
+aos capsule build . --output ./dist
 
 # Run the unit tests on the native host target. The default target is WASM,
 # which cannot execute test binaries, so this flag is required.
