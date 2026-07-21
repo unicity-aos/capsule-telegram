@@ -102,11 +102,16 @@ All state (sessions, update offset) is persisted in the kernel KV store.
 ## Development
 
 ```bash
-# Build for WASM
-cargo build --target wasm32-wasip1 --release
+# Build for WASM. The target and the getrandom backend both come from
+# .cargo/config.toml, so no --target flag is needed.
+cargo build --release
 
-# Run tests (native)
-cargo test
+# Package an installable .capsule artifact
+astrid capsule build . --output ./dist
+
+# Run the unit tests on the native host target. The default target is WASM,
+# which cannot execute test binaries, so this flag is required.
+cargo test --target x86_64-unknown-linux-gnu
 ```
 
 ## License
