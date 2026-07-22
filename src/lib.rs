@@ -45,6 +45,39 @@ const MAX_TEXT_BUFFER: usize = 256 * 1024;
 /// KV key for the last processed Telegram update offset.
 const KV_OFFSET: &str = "tg.offset";
 
+/// Approval decision strings, as the host parses them.
+///
+/// `decision_from_str` in astrid-capsule matches "approve", "approve_session"
+/// and "approve_always" exactly, and maps every other string — including a
+/// plausible-looking "allow_once" — to `Denied`. That fallback is a silent
+/// deny, not an error, so a drifted spelling turns every approval into a
+/// refusal with nothing in the logs. These constants give the emitted
+/// `callback_data` one definition that tests can pin.
+const DECISION_APPROVE_ONCE: &str = "approve";
+const DECISION_APPROVE_SESSION: &str = "approve_session";
+/// Deliberately outside the host's accepted set: its catch-all arm denies,
+/// which is exactly what the Deny button wants.
+const DECISION_DENY: &str = "deny";
+
+/// Build the approval inline keyboard buttons for a callback token.
+///
+/// Extracted so tests exercise the exact `callback_data` a user's device sends
+/// back, rather than restating the decision strings and asserting literals
+/// against literals.
+fn approval_buttons(cb_token: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "Allow Once".into(),
+            format!("apr:{cb_token}:{DECISION_APPROVE_ONCE}"),
+        ),
+        (
+            "Allow Session".into(),
+            format!("apr:{cb_token}:{DECISION_APPROVE_SESSION}"),
+        ),
+        ("Deny".into(), format!("apr:{cb_token}:{DECISION_DENY}")),
+    ]
+}
+
 /// Monotonic clock reading, standing in for [`std::time::Instant`].
 ///
 /// `Instant::now()` panics on `wasm32-unknown-unknown` ("time not implemented
@@ -965,19 +998,7 @@ fn handle_approval_request(
         },
     );
 
-    // The decision strings are the kernel's wire vocabulary, not display text:
-    // `decision_from_str` matches "approve" / "approve_session" /
-    // "approve_always" and maps EVERYTHING else — including "allow_once" — to
-    // Denied. Sending our own spelling silently turned every approval into a
-    // denial, so these must stay in step with the host's parser.
-    let keyboard = telegram::inline_keyboard(vec![
-        ("Allow Once".into(), format!("apr:{cb_token}:approve")),
-        (
-            "Allow Session".into(),
-            format!("apr:{cb_token}:approve_session"),
-        ),
-        ("Deny".into(), format!("apr:{cb_token}:deny")),
-    ]);
+    let keyboard = telegram::inline_keyboard(approval_buttons(&cb_token));
 
     let _ = telegram::send_message(token, chat_id, &text, Some("HTML"), Some(&keyboard));
 }
@@ -1325,24 +1346,35 @@ mod tests {
 
     /// The decision strings are a wire contract with the host, not display
     /// text. `decision_from_str` in astrid-capsule matches exactly "approve",
-    /// "approve_session" and "approve_always", and maps every other string —
-    /// including a plausible-looking "allow_once" — to `Denied`. Because the
-    /// fallback is a silent deny rather than an error, a drifted spelling
-    /// turns every approval into a denial with nothing in the logs. Pin the
-    /// vocabulary here so that failure is caught at build time.
+    /// "approve_session" and "approve_always" and maps every other string to
+    /// `Denied`. That fallback is a silent deny rather than an error, so a
+    /// drifted spelling turns every approval into a denial with nothing in the
+    /// logs.
+    ///
+    /// This asserts against the `callback_data` that `approval_buttons`
+    /// actually emits, so reverting the keyboard to `allow_*` fails the build.
+    /// Pinning bare literals here would be tautological and guard nothing.
     #[test]
-    fn approval_decisions_use_the_host_vocabulary() {
+    fn emitted_approval_decisions_use_the_host_vocabulary() {
         const HOST_ACCEPTED: [&str; 3] = ["approve", "approve_session", "approve_always"];
-        for decision in ["approve", "approve_session"] {
+
+        let decisions: Vec<String> = approval_buttons("tok")
+            .into_iter()
+            .map(|(_, data)| data.splitn(3, ':').nth(2).unwrap().to_string())
+            .collect();
+        assert_eq!(decisions.len(), 3, "expected three approval buttons");
+
+        for d in &decisions[..2] {
             assert!(
-                HOST_ACCEPTED.contains(&decision),
-                "'{decision}' is not accepted by the host parser and would be \
-                 silently treated as a denial"
+                HOST_ACCEPTED.contains(&d.as_str()),
+                "emitted decision '{d}' is not accepted by the host parser and \
+                 would be silently treated as a denial"
             );
         }
-        // "deny" is deliberately NOT in the accepted set: the host's catch-all
-        // arm denies, which is the outcome the Deny button wants.
-        assert!(!HOST_ACCEPTED.contains(&"deny"));
+        // Distinct, or "Allow Session" silently behaves as "Allow Once".
+        assert_ne!(decisions[0], decisions[1]);
+        // Deny relies on the catch-all arm, so it must NOT be accepted.
+        assert!(!HOST_ACCEPTED.contains(&decisions[2].as_str()));
     }
 
     /// Every button's callback_data must fit Telegram's 64-byte cap, including
@@ -1350,11 +1382,10 @@ mod tests {
     #[test]
     fn every_approval_button_fits_the_callback_limit() {
         let token = callback_token(&"z".repeat(200));
-        for decision in ["approve", "approve_session", "deny"] {
-            let data = format!("apr:{token}:{decision}");
+        for (label, data) in approval_buttons(&token) {
             assert!(
                 data.len() <= 64,
-                "callback_data for '{decision}' is {} bytes",
+                "callback_data for '{label}' is {} bytes: {data}",
                 data.len()
             );
         }
