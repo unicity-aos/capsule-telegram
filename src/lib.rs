@@ -939,7 +939,7 @@ fn handle_approval_request(
 
     // Generate a short callback token from the request_id to fit within
     // Telegram's 64-byte callback_data limit ("apr:" + ":" + "approve_session"
-    // = 18 bytes overhead, leaving 46 bytes for the token). If the request_id
+    // = 20 bytes overhead, leaving 44 bytes for the token). If the request_id
     // already fits, use it directly; otherwise hash it to avoid collisions
     // from naive prefix truncation.
     let cb_token = callback_token(request_id);
@@ -1296,8 +1296,9 @@ mod tests {
     fn callback_token_long_id_hashed() {
         let long_id = "a".repeat(100);
         let token = callback_token(&long_id);
-        // Must fit in 46 bytes for callback_data.
-        assert!(token.len() <= 46, "token too long: {}", token.len());
+        // Must fit the 44-byte token budget: 64 - len("apr:") - len(":")
+        // - len("approve_session").
+        assert!(token.len() <= 44, "token too long: {}", token.len());
         // Must be a 16-char hex string.
         assert_eq!(token.len(), 16);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
