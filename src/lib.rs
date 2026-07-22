@@ -45,6 +45,39 @@ const MAX_TEXT_BUFFER: usize = 256 * 1024;
 /// KV key for the last processed Telegram update offset.
 const KV_OFFSET: &str = "tg.offset";
 
+/// Approval decision strings, as the host parses them.
+///
+/// `decision_from_str` in astrid-capsule matches "approve", "approve_session"
+/// and "approve_always" exactly, and maps every other string — including a
+/// plausible-looking "allow_once" — to `Denied`. That fallback is a silent
+/// deny, not an error, so a drifted spelling turns every approval into a
+/// refusal with nothing in the logs. These constants give the emitted
+/// `callback_data` one definition that tests can pin.
+const DECISION_APPROVE_ONCE: &str = "approve";
+const DECISION_APPROVE_SESSION: &str = "approve_session";
+/// Deliberately outside the host's accepted set: its catch-all arm denies,
+/// which is exactly what the Deny button wants.
+const DECISION_DENY: &str = "deny";
+
+/// Build the approval inline keyboard buttons for a callback token.
+///
+/// Extracted so tests exercise the exact `callback_data` a user's device sends
+/// back, rather than restating the decision strings and asserting literals
+/// against literals.
+fn approval_buttons(cb_token: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "Allow Once".into(),
+            format!("apr:{cb_token}:{DECISION_APPROVE_ONCE}"),
+        ),
+        (
+            "Allow Session".into(),
+            format!("apr:{cb_token}:{DECISION_APPROVE_SESSION}"),
+        ),
+        ("Deny".into(), format!("apr:{cb_token}:{DECISION_DENY}")),
+    ]
+}
+
 /// Monotonic clock reading, standing in for [`std::time::Instant`].
 ///
 /// `Instant::now()` panics on `wasm32-unknown-unknown` ("time not implemented
@@ -938,8 +971,8 @@ fn handle_approval_request(
     );
 
     // Generate a short callback token from the request_id to fit within
-    // Telegram's 64-byte callback_data limit ("apr:" + ":" + "allow_session"
-    // = 18 bytes overhead, leaving 46 bytes for the token). If the request_id
+    // Telegram's 64-byte callback_data limit ("apr:" + ":" + "approve_session"
+    // = 20 bytes overhead, leaving 44 bytes for the token). If the request_id
     // already fits, use it directly; otherwise hash it to avoid collisions
     // from naive prefix truncation.
     let cb_token = callback_token(request_id);
@@ -965,14 +998,7 @@ fn handle_approval_request(
         },
     );
 
-    let keyboard = telegram::inline_keyboard(vec![
-        ("Allow Once".into(), format!("apr:{cb_token}:allow_once")),
-        (
-            "Allow Session".into(),
-            format!("apr:{cb_token}:allow_session"),
-        ),
-        ("Deny".into(), format!("apr:{cb_token}:deny")),
-    ]);
+    let keyboard = telegram::inline_keyboard(approval_buttons(&cb_token));
 
     let _ = telegram::send_message(token, chat_id, &text, Some("HTML"), Some(&keyboard));
 }
@@ -1103,12 +1129,15 @@ fn finalize_turn_text(token: &str, chat_id: i64, turn: &mut TurnState) {
 
 /// Generate a short callback token from a request_id.
 ///
-/// If the id fits in 46 bytes (leaving room for "apr:" + ":" + "allow_session"
-/// within Telegram's 64-byte callback_data limit), use it directly.
-/// Otherwise, produce a hex-encoded hash prefix that avoids collisions from
-/// naive string truncation.
+/// If the id fits within the callback_data budget, use it directly. Otherwise,
+/// produce a hex-encoded hash prefix that avoids collisions from naive string
+/// truncation.
+///
+/// Telegram caps callback_data at 64 bytes. The envelope is
+/// `"apr:" + token + ":" + decision`, and the longest decision the kernel
+/// accepts is `approve_session` (15 bytes), leaving 64 - 4 - 1 - 15 = 44.
 fn callback_token(request_id: &str) -> String {
-    const MAX_TOKEN_LEN: usize = 46;
+    const MAX_TOKEN_LEN: usize = 44;
     // Always hash if the id contains ':' to avoid ambiguous callback_data parsing
     // (callback format uses ':' as delimiter).
     if request_id.len() <= MAX_TOKEN_LEN && !request_id.contains(':') {
@@ -1288,8 +1317,9 @@ mod tests {
     fn callback_token_long_id_hashed() {
         let long_id = "a".repeat(100);
         let token = callback_token(&long_id);
-        // Must fit in 46 bytes for callback_data.
-        assert!(token.len() <= 46, "token too long: {}", token.len());
+        // Must fit the 44-byte token budget: 64 - len("apr:") - len(":")
+        // - len("approve_session").
+        assert!(token.len() <= 44, "token too long: {}", token.len());
         // Must be a 16-char hex string.
         assert_eq!(token.len(), 16);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
@@ -1306,11 +1336,58 @@ mod tests {
     fn callback_token_fits_in_callback_data() {
         let long_id = "z".repeat(200);
         let token = callback_token(&long_id);
-        let data = format!("apr:{token}:allow_session");
+        let data = format!("apr:{token}:approve_session");
         assert!(
             data.len() <= 64,
             "callback_data too long: {} bytes",
             data.len()
         );
+    }
+
+    /// The decision strings are a wire contract with the host, not display
+    /// text. `decision_from_str` in astrid-capsule matches exactly "approve",
+    /// "approve_session" and "approve_always" and maps every other string to
+    /// `Denied`. That fallback is a silent deny rather than an error, so a
+    /// drifted spelling turns every approval into a denial with nothing in the
+    /// logs.
+    ///
+    /// This asserts against the `callback_data` that `approval_buttons`
+    /// actually emits, so reverting the keyboard to `allow_*` fails the build.
+    /// Pinning bare literals here would be tautological and guard nothing.
+    #[test]
+    fn emitted_approval_decisions_use_the_host_vocabulary() {
+        const HOST_ACCEPTED: [&str; 3] = ["approve", "approve_session", "approve_always"];
+
+        let decisions: Vec<String> = approval_buttons("tok")
+            .into_iter()
+            .map(|(_, data)| data.splitn(3, ':').nth(2).unwrap().to_string())
+            .collect();
+        assert_eq!(decisions.len(), 3, "expected three approval buttons");
+
+        for d in &decisions[..2] {
+            assert!(
+                HOST_ACCEPTED.contains(&d.as_str()),
+                "emitted decision '{d}' is not accepted by the host parser and \
+                 would be silently treated as a denial"
+            );
+        }
+        // Distinct, or "Allow Session" silently behaves as "Allow Once".
+        assert_ne!(decisions[0], decisions[1]);
+        // Deny relies on the catch-all arm, so it must NOT be accepted.
+        assert!(!HOST_ACCEPTED.contains(&decisions[2].as_str()));
+    }
+
+    /// Every button's callback_data must fit Telegram's 64-byte cap, including
+    /// the longest decision, when the request id is hashed to a token.
+    #[test]
+    fn every_approval_button_fits_the_callback_limit() {
+        let token = callback_token(&"z".repeat(200));
+        for (label, data) in approval_buttons(&token) {
+            assert!(
+                data.len() <= 64,
+                "callback_data for '{label}' is {} bytes: {data}",
+                data.len()
+            );
+        }
     }
 }
